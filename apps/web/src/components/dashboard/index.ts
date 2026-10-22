@@ -6,6 +6,8 @@ export * from "./WalletList";
 export * from "./EmptyWatchersState";
 export * from "./PaymentTable";
 export * from "./NotificationModal";
+export * from "./DashboardHeader";
+export * from "./DeliveryToast";
 export * from "./SorobanSimulationSandbox";
 export * from "./SorobanEventInspector";
 export * from "./ActivityHeatmap";

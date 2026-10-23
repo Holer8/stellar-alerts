@@ -14,13 +14,14 @@ import { isValidE164Number } from '../../utils/whatsapp';
 import { isValidSlackWebhookUrl } from '../../utils/slack';
 import { ValidationError } from '../../lib/errors';
 import { dispatchPushNotification } from '../../utils/push-protocol';
-import {
-  normalizeEmailTemplatePreferences,
-  parseStoredEmailTemplate,
-} from '../../utils/email-template';
-
+import { createLogger } from '../../lib/logger';
 import { slackNotificationProvider } from './providers/slack.provider';
-import { logger } from '../../lib/logger';
+import { discordNotificationProvider } from './providers/discord.provider';
+import type { DiscordAlertInput, DiscordDispatchOptions } from './providers/discord.provider';
+import type { PagerDutyAlertInput } from './providers/pagerduty.provider';
+import type { OpsgenieAlertInput } from './providers/opsgenie.provider';
+
+const logger = createLogger({ module: 'NotificationsService' });
 
 export function isValidDiscordWebhookUrl(url: string): boolean {
   try {
@@ -371,6 +372,42 @@ export class NotificationsService {
   }
 
   /**
+   * Dispatch a Slack Block Kit notification to a webhook or bot channel.
+   */
+  async dispatchSlackNotification(
+    target: { webhookUrl?: string | null; botToken?: string | null; channel?: string | null },
+    alert: Parameters<typeof slackNotificationProvider.dispatch>[1],
+    options?: Parameters<typeof slackNotificationProvider.dispatch>[2],
+  ) {
+    const slackTarget: { webhookUrl?: string; botToken?: string; channel?: string } = {};
+    if (target.webhookUrl) slackTarget.webhookUrl = target.webhookUrl;
+    if (target.botToken) slackTarget.botToken = target.botToken;
+    if (target.channel) slackTarget.channel = target.channel;
+
+    if (options) {
+      return slackNotificationProvider.dispatch(slackTarget, alert, options);
+    }
+    return slackNotificationProvider.dispatch(slackTarget, alert);
+  }
+
+  /**
+   * Dispatch a native Discord embed alert to a user-configured webhook.
+   * Handles severity colors, Stellar Expert links, asset icons, and
+   * Discord rate-limit retries.
+   */
+  async dispatchDiscordNotification(
+    target: { webhookUrl?: string | null },
+    alert: DiscordAlertInput,
+    options?: DiscordDispatchOptions,
+  ) {
+    return discordNotificationProvider.dispatch(
+      { webhookUrl: target.webhookUrl ?? undefined },
+      alert,
+      options,
+    );
+  }
+
+  /**
    * Dispatch a PagerDuty incident trigger (Events API v2) for a security alert.
    * Maps alert severity (critical/error/warning) to PagerDuty severity and
    * derives a stable deduplication key so repeated alerts collapse into one
@@ -391,7 +428,18 @@ export class NotificationsService {
     },
   ) {
     const { pagerDutyProvider } = await import('./providers/pagerduty.provider');
-    return pagerDutyProvider.trigger(target, alert);
+    const input: PagerDutyAlertInput = {
+      message: alert.summary,
+      severity: alert.severity,
+      source: alert.source,
+      dedupKey: alert.dedupKey,
+      component: alert.component,
+      group: alert.group,
+      class: alert.class,
+      customDetails: alert.customDetails,
+      links: alert.links,
+    };
+    return pagerDutyProvider.dispatchTrigger(input, { routingKey: target.routingKey });
   }
 
   /**
@@ -412,37 +460,17 @@ export class NotificationsService {
     },
   ) {
     const { opsgenieProvider } = await import('./providers/opsgenie.provider');
-    return opsgenieProvider.createAlert(target, alert);
-  }
-
-  /**
-   * Trigger the 24-hour transaction & security digest for a single user.
-   * Respects the user's digest frequency setting (daily/weekly/off).
-   *
-   * @param userId - User ID
-   * @param options - Optional overrides (e.g. force send for testing)
-   */
-  async sendDigest(
-    userId: string,
-    options: { force?: boolean } = {}
-  ): Promise<{ sent: boolean; reason?: string }> {
-    const prefs = await prisma.notificationPreference.findUnique({ where: { userId } });
-    if (!prefs) {
-      return { sent: false, reason: 'no_preferences' };
-    }
-    // Lazy-load the digest worker so a broken/missing worker module cannot
-    // break this service at import time.
-    try {
-      const mod = await import('../../workers/digest.worker');
-      const digestWorker = (mod as any)?.digestWorker;
-      if (!digestWorker || typeof digestWorker.processUser !== 'function') {
-        return { sent: false, reason: 'digest_worker_unavailable' };
-      }
-      return await digestWorker.processUser(userId, prefs, options);
-    } catch (error: any) {
-      logger.warn?.('[NotificationsService] digest worker unavailable', error?.message);
-      return { sent: false, reason: error?.message || 'digest_worker_unavailable' };
-    }
+    const input: OpsgenieAlertInput = {
+      message: alert.message,
+      severity: alert.severity,
+      alias: alert.alias,
+      description: alert.description,
+      source: alert.source,
+      tags: alert.tags,
+      details: alert.details,
+      responders: alert.responders as OpsgenieAlertInput['responders'],
+    };
+    return opsgenieProvider.dispatchAlert(input, { apiKey: target.apiKey });
   }
 
   /**

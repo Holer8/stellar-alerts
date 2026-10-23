@@ -348,15 +348,19 @@ model Webhook {
 }
 
 model WebhookLog {
-  id           String   @id @default(cuid())
-  webhookId    String
-  webhook      Webhook  @relation(fields: [webhookId], references: [id], onDelete: Cascade)
-  statusCode   Int?
-  responseBody String?
-  durationMs   Float?
-  error        String?
-  sentAt       DateTime @default(now())
-  createdAt    DateTime @default(now())
+  id             String   @id @default(cuid())
+  webhookId      String
+  webhook        Webhook  @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+  requestUrl     String?
+  requestPayload String?
+  statusCode     Int?
+  responseBody   String?
+  durationMs     Float?
+  error          String?
+  sentAt         DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  @@index([webhookId, sentAt])
 }
 
 model WebhookCircuitBreaker {

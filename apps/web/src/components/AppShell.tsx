@@ -56,18 +56,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const getHeaders = useSessionHeaders();
   const batchReader = useBatchReader();
 
-  const handleSavePreferences = async (prefs: { telegramChatId?: string; emailEnabled: boolean }) => {
-    try {
-      await fetch(`${API_BASE_URL}/notifications/preferences`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getHeaders() },
-        body: JSON.stringify(prefs),
-      });
-    } catch (err) {
-      console.error('Failed to save notification preferences:', err);
-    }
-  };
-
   // Adapters for the onboarding wizard: each step throws on failure so the
   // wizard can show an inline, retryable error instead of silently advancing.
   const walletAdapter = useMemo(
@@ -275,7 +263,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <NotificationModal
         isOpen={isNotificationModalOpen}
         onClose={() => setIsNotificationModalOpen(false)}
-        onSavePreferences={handleSavePreferences}
+        accessToken={session?.accessToken}
       />
 
       {/* Three-step onboarding wizard: wallet connection → Telegram linking → notification preferences */}

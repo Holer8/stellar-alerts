@@ -1,13 +1,15 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback } from 'react';
 import NetworkVisualizer3D from '@/components/dashboard/NetworkVisualizer3D';
 import AuditWorkspace from '@/components/dashboard/AuditWorkspace';
 import { useSession } from 'next-auth/react';
-import { WalletDTO, PaymentDTO, DeliveryEventDTO } from '@stellar-alerts/shared';
+import type { PathPaymentFlow } from '@/components/dashboard';
 import { WatcherForm } from '@/components/WatcherForm';
 import {
   DashboardGrid,
+  DashboardHeader,
+  DeliveryToast,
   SummaryStats,
   VolumeChart,
   WebhookSandbox,
@@ -17,134 +19,40 @@ import {
   ActivityHeatmap,
   EmailTemplatePreview,
   SankeyFlowDiagram,
-  type PathPaymentFlow,
 } from '@/components/dashboard';
-import { useBatchReader } from '@/lib/hooks/useBatchReader';
-import { getSocket } from '@/lib/socket';
+import { useDashboardData } from '@/hooks/useDashboardData';
+import { useLiveDashboardStream } from '@/hooks/useLiveDashboardStream';
 import { useEmailTemplatePreference } from '@/hooks/useEmailTemplatePreference';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001';
+// Multi-hop path payment routes. The ingestion worker does not yet record
+// path_payment_* offer chains, so this stays empty until a path-flows feed
+// is available; the Sankey card renders its own empty state meanwhile.
+const PATH_PAYMENT_FLOWS: PathPaymentFlow[] = [];
 
 export default function DashboardPage() {
   const { data: session } = useSession();
-  const batchReader = useBatchReader();
-
-  const [wallets, setWallets] = useState<WalletDTO[]>([]);
-  const [selectedWalletId, setSelectedWalletId] = useState<string | null>(null);
-  const [payments, setPayments] = useState<PaymentDTO[]>([]);
-  const [isLoadingPayments, setIsLoadingPayments] = useState<boolean>(false);
-  // Until the first portfolio fetch lands, "no wallets" is unknown, not empty.
-  // Without this the onboarding card would flash for users who already have one.
-  const [hasLoadedPortfolio, setHasLoadedPortfolio] = useState<boolean>(false);
-  const [totalVolumeXLM, setTotalVolumeXLM] = useState<number>(0);
-  const [totalPaymentsCount, setTotalPaymentsCount] = useState<number>(0);
-  const [crossLedgerAnalytics] = useState<any>(null);
-  const [isStreamConnected, setIsStreamConnected] = useState<boolean>(false);
-  const [latestDelivery, setLatestDelivery] = useState<DeliveryEventDTO | null>(null);
-  // Multi-hop path payment routes. The ingestion worker does not yet record
-  // path_payment_* offer chains, so this stays empty until a path-flows feed
-  // is available; the Sankey card renders its own empty state meanwhile.
-  const [pathPaymentFlows] = useState<PathPaymentFlow[]>([]);
+  const {
+    wallets,
+    payments,
+    selectedWalletId,
+    setSelectedWalletId,
+    isLoadingPayments,
+    hasLoadedPortfolio,
+    totalPaymentsCount,
+    totalVolumeXLM,
+    applyLivePayment,
+    refreshAfterMutation,
+    removeWallet,
+  } = useDashboardData();
+  const { isStreamConnected, latestDelivery } = useLiveDashboardStream(
+    session?.accessToken,
+    selectedWalletId,
+    applyLivePayment,
+  );
   const {
     template: savedEmailTemplate,
     saveTemplate: saveEmailTemplate,
   } = useEmailTemplatePreference(session?.accessToken);
-
-  const fetchDashboardData = useCallback(async () => {
-    if (!session) return;
-    setIsLoadingPayments(true);
-    try {
-      const data = await batchReader.fetchUserPortfolioBatched(selectedWalletId || undefined);
-      setWallets(data.wallets);
-      setPayments(data.payments);
-      setTotalVolumeXLM(Number(data.summary.totalVolumeXLM || 0));
-      setTotalPaymentsCount(Number(data.summary.totalPayments || 0));
-      setHasLoadedPortfolio(true);
-    } catch (err) {
-      console.error('Failed to fetch dashboard data:', err);
-    } finally {
-      setIsLoadingPayments(false);
-    }
-  }, [session, selectedWalletId, batchReader]);
-
-  useEffect(() => {
-    if (session) void fetchDashboardData();
-  }, [session, selectedWalletId, fetchDashboardData]);
-
-  const refreshAfterMutation = useCallback(() => {
-    batchReader.invalidateAll();
-    void fetchDashboardData();
-  }, [batchReader, fetchDashboardData]);
-
-  // Kept in a ref (not a dependency) so the payment handler below always
-  // reads the current filter without tearing down/reconnecting the socket
-  // every time the user switches the selected wallet.
-  const selectedWalletIdRef = useRef(selectedWalletId);
-  useEffect(() => {
-    selectedWalletIdRef.current = selectedWalletId;
-  }, [selectedWalletId]);
-
-  // Live payment stream: relays persisted payment events for the signed-in
-  // user's own wallets over the authenticated WebSocket (server enforces
-  // tenant isolation — see apps/api/src/plugins/websocket.ts).
-  useEffect(() => {
-    const accessToken = session?.accessToken;
-    if (!accessToken) return;
-
-    const socket = getSocket();
-    socket.connect(accessToken);
-
-    const unsubscribeConnection = socket.on('connection', (msg) => {
-      setIsStreamConnected(msg.payload?.status === 'connected');
-    });
-
-    const unsubscribePayment = socket.onPayment((payment) => {
-      const currentWalletId = selectedWalletIdRef.current;
-      if (currentWalletId && payment.walletId !== currentWalletId) return;
-      setPayments((prev) => {
-        if (prev.some((p) => p.id === payment.id)) return prev;
-        return [payment, ...prev];
-      });
-      setTotalPaymentsCount((prev) => prev + 1);
-      setTotalVolumeXLM((prev) => prev + Number(payment.amount || 0));
-    });
-
-    const unsubscribeDelivery = socket.onDelivery((delivery) => {
-      setLatestDelivery(delivery);
-    });
-
-    return () => {
-      unsubscribeConnection();
-      unsubscribePayment();
-      unsubscribeDelivery();
-      socket.disconnect();
-      setIsStreamConnected(false);
-    };
-  }, [session]);
-
-  // Auto-dismiss the live delivery toast after a few seconds.
-  useEffect(() => {
-    if (!latestDelivery) return;
-    const timer = setTimeout(() => setLatestDelivery(null), 6000);
-    return () => clearTimeout(timer);
-  }, [latestDelivery]);
-
-  const handleRemoveWallet = async (id: string) => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/wallets/${id}`, {
-        method: 'DELETE',
-        headers: {
-          Authorization: session?.accessToken ? `Bearer ${session.accessToken}` : '',
-        },
-      });
-      if (res.ok) {
-        if (selectedWalletId === id) setSelectedWalletId(null);
-        refreshAfterMutation();
-      }
-    } catch (err) {
-      console.error('Failed to remove wallet:', err);
-    }
-  };
 
   // The Add Wallet flow is the watcher form below the grid, not a modal, so
   // "open it" means scroll it into view and put the cursor in its first field.
@@ -157,37 +65,9 @@ export default function DashboardPage() {
 
   return (
     <div className="min-w-0 space-y-8">
-      {/* Live webhook delivery toast (populated over the authenticated WebSocket) */}
-      {latestDelivery && (
-        <div
-          data-testid="delivery-toast"
-          className="fixed bottom-4 right-4 left-4 sm:left-auto z-[60] max-w-sm px-4 py-3 rounded-xl bg-slate-900/90 border border-slate-700 backdrop-blur-xl shadow-2xl"
-        >
-          <p className="text-xs font-semibold text-white flex items-center gap-2">
-            <span>📬</span> Webhook Delivery
-          </p>
-          <p className="text-xs text-slate-400 mt-1">
-            {latestDelivery.error
-              ? `Failed: ${latestDelivery.error}`
-              : `Status ${latestDelivery.statusCode ?? 'unknown'}`}
-          </p>
-        </div>
-      )}
+      <DeliveryToast delivery={latestDelivery} />
 
-      {/* Header Banner */}
-      <div className="p-5 sm:p-8 rounded-3xl bg-gradient-to-r from-cyan-950/40 via-blue-950/30 to-purple-950/20 border border-cyan-500/20 flex flex-col md:flex-row items-start md:items-center justify-between gap-6 relative overflow-hidden">
-        <div className="absolute top-0 right-0 w-96 h-96 bg-cyan-500/10 rounded-full blur-3xl -mr-32 -mt-32 pointer-events-none"></div>
-        <div>
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-xs font-semibold mb-3">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
-            Watcher Service Active
-          </div>
-          <h1 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">Your Real-Time Wallet Dashboard</h1>
-          <p className="text-gray-400 text-sm mt-1 max-w-xl">
-            Monitor connected Stellar Testnet addresses, track live incoming transactions, and export recorded payment history.
-          </p>
-        </div>
-      </div>
+      <DashboardHeader />
 
       {/* Onboarding card: renders only while the user has no wallets. */}
       {hasLoadedPortfolio && (
@@ -202,10 +82,9 @@ export default function DashboardPage() {
             label: 'Summary Overview',
             content: (
               <SummaryStats
-                totalPaymentsCount={totalPaymentsCount || payments.length}
-                totalVolumeXLM={totalVolumeXLM || payments.reduce((acc, p) => acc + Number(p.amount || 0), 0)}
+                totalPaymentsCount={totalPaymentsCount}
+                totalVolumeXLM={totalVolumeXLM}
                 activeWalletsCount={wallets.length}
-                crossLedgerAnalytics={crossLedgerAnalytics}
               />
             ),
           },
@@ -215,7 +94,7 @@ export default function DashboardPage() {
             content: (
               <VolumeChart
                 payments={payments}
-                totalVolumeXLM={totalVolumeXLM || payments.reduce((acc, p) => acc + Number(p.amount || 0), 0)}
+                totalVolumeXLM={totalVolumeXLM}
               />
             ),
           },
@@ -250,8 +129,8 @@ export default function DashboardPage() {
                     <WalletList
                       wallets={wallets}
                       selectedWalletId={selectedWalletId}
-                      onSelectWallet={(id) => setSelectedWalletId(id)}
-                      onRemoveWallet={handleRemoveWallet}
+                      onSelectWallet={setSelectedWalletId}
+                      onRemoveWallet={removeWallet}
                       onOpenAddModal={openAddWalletForm}
                     />
                   ),
@@ -293,7 +172,7 @@ export default function DashboardPage() {
           {
             id: 'sankey-flows',
             label: 'Multi-Hop Payment Flows',
-            content: <SankeyFlowDiagram flows={pathPaymentFlows} />,
+            content: <SankeyFlowDiagram flows={PATH_PAYMENT_FLOWS} />,
           },
         ]}
       />

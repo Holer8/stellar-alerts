@@ -241,8 +241,11 @@ export class WebhooksService {
       select: {
         id: true,
         webhookId: true,
+        requestUrl: true,
+        requestPayload: true,
         statusCode: true,
         responseBody: true,
+        durationMs: true,
         error: true,
         sentAt: true,
         createdAt: true,

@@ -142,6 +142,17 @@ async function assertBotIsChannelAdmin(botToken: string, chatId: string): Promis
   }
 }
 
+const WEBHOOK_LOG_RESPONSE_LIMIT = 5000;
+const WEBHOOK_LOG_PAYLOAD_LIMIT = 10000;
+
+async function readWebhookResponseBody(response: Response): Promise<string> {
+  try {
+    return (await response.text()).substring(0, WEBHOOK_LOG_RESPONSE_LIMIT);
+  } catch {
+    return "";
+  }
+}
+
 export async function getOrCreateCircuitBreaker(
   webhookId: string,
 ): Promise<CircuitBreaker<any>> {
@@ -167,17 +178,21 @@ export async function getOrCreateCircuitBreaker(
         const error = new Error(`Rate limited: ${response.status}`) as Error & {
           statusCode?: number;
           headers?: Headers;
+          responseBody?: string;
         };
         error.statusCode = 429;
         error.headers = response.headers;
+        error.responseBody = await readWebhookResponseBody(response);
         throw error;
       }
 
       if (response.status >= 500) {
         const error = new Error(`Server error: ${response.status}`) as Error & {
           statusCode?: number;
+          responseBody?: string;
         };
         error.statusCode = response.status;
+        error.responseBody = await readWebhookResponseBody(response);
         throw error;
       }
 
@@ -261,6 +276,14 @@ export async function dispatchWebhookAndLog(
   traceparent?: string,
 ) {
   let targetUrl: string | undefined;
+  // Request context persisted on every WebhookLog row so users can debug
+  // exactly what was sent, where, and how the endpoint answered.
+  let requestPayload: string | undefined;
+  let startedAt: number | undefined;
+  const requestContext = () => ({
+    requestUrl: targetUrl,
+    requestPayload: requestPayload?.substring(0, WEBHOOK_LOG_PAYLOAD_LIMIT),
+  });
 
   try {
     const webhook = await prisma.webhook.findUnique({
@@ -283,6 +306,7 @@ export async function dispatchWebhookAndLog(
       await prisma.webhookLog.create({
         data: {
           webhookId,
+          ...requestContext(),
           error: `SSRF blocked: ${ssrfErr.message}`,
         },
       });
@@ -301,6 +325,7 @@ export async function dispatchWebhookAndLog(
         await prisma.webhookLog.create({
           data: {
             webhookId,
+            ...requestContext(),
             error: "Circuit breaker is open, endpoint temporarily disabled",
           },
         });
@@ -328,6 +353,7 @@ export async function dispatchWebhookAndLog(
       await prisma.webhookLog.create({
         data: {
           webhookId,
+          ...requestContext(),
           error: `Payload template ${templateResult.phase} error: ${templateResult.error}`,
         },
       });
@@ -335,6 +361,7 @@ export async function dispatchWebhookAndLog(
     }
 
     const payloadString = templateResult.body;
+    requestPayload = payloadString;
     // Dual-signature headers (#721): during an active rotation grace period
     // this attaches both the new secret's signature and the previous
     // secret's, so subscribers who haven't redeployed the rotated secret
@@ -346,18 +373,21 @@ export async function dispatchWebhookAndLog(
 
     const breaker = await getOrCreateCircuitBreaker(webhookId);
     const dispatchMeta: WebhookDispatchMeta = { webhookId, traceparent };
+    startedAt = Date.now();
     const response = await breaker.fire(webhook.url, payloadString, {
       "Content-Type": "application/json",
       ...signatureHeaders,
     }, dispatchMeta);
 
-    const responseBody = await response.text();
+    const responseBody = await readWebhookResponseBody(response);
 
     const deliveryLog = await prisma.webhookLog.create({
       data: {
         webhookId,
+        ...requestContext(),
         statusCode: response.status,
-        responseBody: responseBody.substring(0, 5000),
+        responseBody,
+        durationMs: Date.now() - startedAt,
       },
     });
     await publishDeliveryEvent(webhook.userId, deliveryLog);
@@ -383,6 +413,7 @@ export async function dispatchWebhookAndLog(
       await prisma.webhookLog.create({
         data: {
           webhookId,
+          ...requestContext(),
           error: "Circuit breaker is open",
         },
       });
@@ -394,7 +425,10 @@ export async function dispatchWebhookAndLog(
       await prisma.webhookLog.create({
         data: {
           webhookId,
+          ...requestContext(),
           statusCode: 429,
+          responseBody: error.responseBody,
+          durationMs: startedAt !== undefined ? Date.now() - startedAt : undefined,
           error: `Endpoint rate limited webhook delivery; retrying after ${delayMs}ms`,
         },
       });
@@ -431,6 +465,10 @@ export async function dispatchWebhookAndLog(
     const failureLog = await prisma.webhookLog.create({
       data: {
         webhookId,
+        ...requestContext(),
+        statusCode: typeof error.statusCode === "number" ? error.statusCode : undefined,
+        responseBody: error.responseBody,
+        durationMs: startedAt !== undefined ? Date.now() - startedAt : undefined,
         error: error.message.substring(0, 1000),
       },
     });
